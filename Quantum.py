@@ -1,0 +1,476 @@
+import os # Lets us access things in the operating system
+import numpy as np 
+import h5py # Used for file access within the .h5 file format
+from scipy.signal import resample
+from qiskit import QuantumCircuit, transpile
+from qiskit.quantum_info import Statevector
+from qiskit.circuit.library import QFT
+from qiskit_aer import AerSimulator # 
+import matplotlib.pyplot as plt # Graphs lots of things
+from typing import Dict, List, Tuple
+#Preogress bar stuff to show you how long could be left
+from tqdm import tqdm
+import Quantum_Graphs as plotting
+
+
+class QuantumGWDetector:
+    """
+    Quantum Gravitational Wave Detector that implements both classical and quantum 
+    approaches to gravitational wave signal detection using matched filtering techniques
+
+    Programmed by Andrew Washburn - Last update on July 30 2025 
+    I tried to comment most things, but if anything needs clarification or if you have any questions or comments, please reach out :)
+
+    This was made as part of my time with the Institue for Computing in Resarch using open sourse software
+
+    
+    
+    The quantum approach uses a Quantum Fourier Transform (QFT) and the divide-and-conquer
+    algorithms 
+    """
+
+    def __init__(self, n_qubits: int, shots: int):
+    
+        # n_qubits is how many qubits are used in the program
+        self.n_qubits = n_qubits
+        
+        # Calculate the vector length based on qubits (2^n_qubits)
+        self.vector_len = 2 ** n_qubits
+        
+        # shots are the number of tests done on the qubits
+        self.shots = shots
+        
+        # Initialize the quantum simulator for running quantum circuits. We are using Aer simulator becase it can inject realistic noise if needed
+        # and can utilise GPU resources if necessary
+        self.simulator = AerSimulator()
+
+        # Storage for original signals and templates for visualization
+        self.original_signal = None  # Stores the raw input signal
+        self.original_signal_times = None  # Stores time data for the signal
+        self.original_templates = {}  # Dictionary to store template data
+
+
+
+    
+    def load_signal(self, path: str) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        Load gravitational wave signal data from HDF5 files.
+                    
+        This will return signal amplitudes and corresponding time values in a tuple
+        """
+        try:
+            # Open HDF5 file and extract signal and time data
+            with h5py.File(path, 'r') as f:
+                return f['signal'][:], f['times'][:]
+        except Exception as e:
+            print(f"Error loading {path}: {e}")
+            return None, None
+
+    def preprocess_signal_for_snr(self, signal: np.ndarray, is_template: bool = False) -> np.ndarray:
+        """
+        Preprocess gravitational wave signals for SNR by normalizing,
+        windowing, and resampling to match quantum circuit requirements.
+        
+        This preprocessing is necessary for quantum-assisted matched filtering because it:
+        1. Standardizes the signal length so that it matches the quantum state vector's size 
+        2. Removes DC components that don't contain gravitational wave information
+        3. Applies windowing to reduce spectral leakage
+        4. Normalizes energy for fair comparison between signals
+        
+        """
+        #Reutrn if there is no signal
+        if signal is None:
+            return None
+
+        # Resample signal to match quantum vector length (2^n_qubits). This makes sure it fits within the quantum computer's computational limits
+        resampled = resample(signal, self.vector_len)
+
+        # Handle complex-valued signals by taking real part only
+        # Gravitational wave signals are typically real-valued strain measurements
+        if np.iscomplexobj(resampled):
+            resampled = np.real(resampled)
+
+        # Remove DC component (mean) for non-template signals
+        # Templates may already be centered, so we skip this step for them
+        if not is_template:
+            resampled -= np.mean(resampled)
+
+        # Apply Hanning window to reduce spectral leakage in frequency domain analysis
+        # This smooths the signal edges and improves frequency domain characteristics
+        window = np.hanning(len(resampled))
+        resampled *= window
+
+        # Normalize by energy (L2 norm) for consistent amplitude scaling
+        # This ensures all signals have unit energy for fair SNR comparison
+        energy = np.sqrt(np.sum(resampled**2))
+        if energy == 0:
+            # Handle edge case of zero-energy signal
+            print("Warning: Signal has zero energy after preprocessing")
+            return np.ones(self.vector_len) / np.sqrt(self.vector_len)
+
+        return resampled / energy
+
+    def compute_classical_snr(self, signal: np.ndarray, template: np.ndarray) -> float:
+        """
+        Compute  classical signal-to-noise ratio using matched filtering
+       
+        Formula: SNR = sqrt(|<signal, template>|^2 / (noise_PSD * ||template||^2))
+        
+        """
+     
+        # Measures how similar the template is to the signal
+        matched_filter_output = np.dot(signal, template)
+        
+        # Estimates the  noise power spectral density
+        noise_psd = self.estimate_noise_psd(signal, template)
+        
+        # Compute the template normalization also knon as energy
+        template_norm_sq = np.dot(template, template)
+
+        # Makes sure we dont divide by Zero or do something to break the program
+        if template_norm_sq == 0 or noise_psd == 0:
+            return 0.0
+
+        # Calculate SNR using the standard matched filtering formula that can be seen above
+        snr_squared = (matched_filter_output**2) / (noise_psd * template_norm_sq)
+        return np.sqrt(snr_squared)
+
+
+
+        
+
+    def estimate_noise_psd(self, signal: np.ndarray, template: np.ndarray) -> float:
+        """
+        Estimate the noise power spectral density from the signal and template.
+        
+        This bassicly estimates noise by assuming the signal contains both the template
+        plus noise. The leftovers after subtracting the
+        optimal template scaling gives us the noise characteristics helping us find the signal.
+        
+        """
+        # Find optimal scaling factor for template to match signal
+        cross_corr = np.dot(signal, template)
+        template_norm = np.dot(template, template)
+
+        if template_norm == 0:
+            # If template has no energy, treat entire signal as noise
+            return np.var(signal)
+
+        # Calculate optimal template amplitude
+        optimal_scale = cross_corr / template_norm
+        
+        # Compute residual (signal minus scaled template)
+        # This residual represents the noise component
+        residual = signal - optimal_scale * template
+        
+        # Estimate noise PSD as the variance of the residual
+        noise_psd = np.var(residual)
+        
+        # Ensure minimum noise level to avoid numerical issues.
+        # If you decided to decrease the added noise below 1e-10 change this number
+        return max(noise_psd, 1e-15)
+
+
+        
+
+    def create_quantum_matched_filter_circuit(self, signal_vec: np.ndarray, template_vec: np.ndarray) -> QuantumCircuit:
+        """
+        Now we get to the fun stuff 
+        
+        Create a quantum circuit for matched filtering using QFT and divide-and-conquer approach
+        
+        Bassicly we:
+        1. Encode both signals as quantum states
+        2. Using QFT for frequency domain operations
+        3. Implementing divide-and-conquer for efficient comparison
+        4. Measuring interference patterns to extract correlation information
+        
+        The circuit uses 2*n + 1 qubits total:
+        - n qubits for signal state
+        - n qubits for template state  
+        - 1 ancilla qubit for controlled operations
+
+        qubits - What a quantum computer uses instead of bits. They are in a super position of 1 and 0
+        ancilla - Extra qubits that are needed because operations need to be reversible. They may go unused in certain cases
+        
+        """
+        n = self.n_qubits
+        # Create circuit with 2*n + 1 qubits and 1 classical bit for measurement
+        # Ancilla + 2 registers for signal and template
+        qc = QuantumCircuit(2*n + 1, 1)  
+
+        # Define the qubit registers for clarity
+        # Signal register: qubits 1 to n
+        signal_reg = list(range(1, n+1))
+        # Template register: qubits n+1 to 2n
+        template_reg = list(range(n+1, 2*n+1))
+        # Ancilla qubit for controlled operations
+        ancilla = 0
+
+        # Step 1: Prepare the quantum states - Here we are putting both of the 
+        # Initialize signal register with signal amplitudes as quantum state
+        qc.initialize(signal_vec, signal_reg)
+        # Initialize template register with template amplitudes as quantum state
+        qc.initialize(template_vec, template_reg)
+
+
+        
+        # Step 2: Apply QFT to both registers
+        # Quantum Fourier Transform maps the time domain to the frequency domain
+        # We are using the Qiskit QFT so that we don't have to make the circuit ourselves
+        qft = QFT(n, do_swaps=False).to_gate()
+        qc.append(qft, signal_reg)
+        qc.append(qft, template_reg)
+
+  
+        # Step 3: Divide-and-conquer 
+        # Process qubits in pairs to reduce circuit depth and improve efficiency
+        for i in range(n//2):
+            # Get qubit pairs from signal and template registers
+            s_q1 = signal_reg[2*i]  # First signal qubit in pair
+            s_q2 = signal_reg[2*i+1] if (2*i+1) < n else None  # Second signal qubit (if exists)
+            
+            t_q1 = template_reg[2*i]  # First template qubit in pair
+            t_q2 = template_reg[2*i+1] if (2*i+1) < n else None  # Second template qubit (if exists)
+            
+            # This creates quantum interference patterns that encode correlation information
+            qc.h(ancilla)  # Put ancilla qubit in superposition
+            qc.cswap(ancilla, s_q1, t_q1)  # Controlled swap between signal and template qubits
+            if s_q2 is not None:
+                # If pair is complete, swap second qubits too
+                qc.cswap(ancilla, s_q2, t_q2)
+            qc.h(ancilla)  # Complete interference measurement
+
+        # Step 4: Inverse QFT to return to time domain
+        iqft = QFT(n, do_swaps=False).inverse().to_gate()
+        qc.append(iqft, signal_reg)
+        qc.append(iqft, template_reg)
+        
+        # Final measurement of ancilla qubit
+        # The measurement result encodes information about signal-template correlation
+        qc.measure(ancilla, 0)
+
+        # Visualize the circuit. Only the print function works right now and I dont know why 
+
+        return qc
+
+    def compute_quantum_snr(self, signal_vec: np.ndarray, template_vec: np.ndarray) -> Tuple[float, Dict[str, float]]:
+        """
+        Compute quantum SNR using the quantum matched filtering approach
+        
+        """
+        # Create the quantum matched filter circuit that is in the function above
+        qc = self.create_quantum_matched_filter_circuit(signal_vec, template_vec)
+        
+        # This can help re-write the circut so that it works will whatever you are running it with and runs it effecntly
+        tqc = transpile(qc, self.simulator)
+        
+        # Run the quantum circuit multiple times (number of shots you decided) for statistical sampling
+        job = self.simulator.run(tqc, shots=self.shots)
+        result = job.result()
+        counts = result.get_counts()
+        
+        # p0 is the probability of measuring the ancilla in the |0⟩ state
+        p0 = counts.get('0', 0) / self.shots
+        
+        # Convert measurement probability to fidelity measure
+        # This transformation maps quantum measurement statistics to correlation strength
+        fidelity = 2 * p0 - 1
+        fidelity = max(fidelity, 0)  # Ensure non-negative fidelity
+        
+        # Calculate SNR using quantum-classical correspondence
+        # Higher fidelity indicates stronger correlation → higher SNR
+        snr_est = np.sqrt(fidelity / (1 - fidelity)) if fidelity < 1 else float('inf')
+        #qc.draw(output="mpl", filename='Circuits/qc_2.png')
+
+        # Return SNR for analysis
+        return snr_est, {
+            'fidelity': fidelity,
+            'p0': p0,
+            'counts': counts
+        }
+
+    def compute_snr_comparison(self, signal_vec: np.ndarray, template_vec: np.ndarray) -> Dict[str, float]:
+        """
+        Compute and compare both classical and quantum SNR for the same signal-template pair.
+        
+        """
+        if signal_vec is None or template_vec is None:
+            return {
+                'classical_snr': 0.0,
+                'quantum_snr': 0.0,
+                'snr_ratio': 0.0,
+                'quantum_advantage': False
+            }
+
+        # Compute classical SNR
+        classical_snr = self.compute_classical_snr(signal_vec, template_vec)
+        
+        # Compute quantum SNR 
+        quantum_snr, diagnostics = self.compute_quantum_snr(signal_vec, template_vec)
+        
+        # Calculate ratio 
+        snr_ratio = quantum_snr / classical_snr if classical_snr > 0 else float('inf')
+        #return the resluts
+        return {
+            'classical_snr': classical_snr,
+            'quantum_snr': quantum_snr,
+            'snr_ratio': snr_ratio,
+            'quantum_advantage': quantum_snr > classical_snr,
+            'quantum_diagnostics': diagnostics
+        }
+
+    def analyze_all_templates(self, signal_path: str, template_folder: str) -> Dict:
+        """
+        Analyze a target signal against all available template signals.
+        
+        This is the primary analysis function that:
+        1. Loads the target gravitational wave signal
+        2. Iterates through all template files in the specified folder
+        3. Computes classical and quantum SNR for each signal-template pair
+        4. Identifies best matches for both classical and quantum approaches
+        5. Stores results for visualization
+        
+      """
+    
+        # Load the target signal from file for analysis
+        signal, signal_times = self.load_signal(signal_path)
+        if signal is None:
+            print("Failed to load signal")
+            return {}
+
+        # Store original signal data for visualization
+        self.original_signal = signal
+        self.original_signal_times = signal_times
+        
+        # Preprocess signal for SNR calculations
+        signal_vec = self.preprocess_signal_for_snr(signal, is_template=False)
+        if signal_vec is None:
+            print("Failed to preprocess signal")
+            return {}
+
+        # Initialize results storage and tracking variables
+        results = {}
+        best_classical_snr = {'template': None, 'snr': -np.inf, 'metrics': {}}
+        best_quantum_snr = {'template': None, 'snr': -np.inf, 'metrics': {}}
+
+        # Get all template files from the specified folder
+        template_files = [f for f in os.listdir(template_folder) if f.endswith('.h5')]
+        template_files.sort()  # Sort for consistent ordering
+        
+        # Analyze each template against the target signal
+        for i, filename in enumerate(tqdm(template_files, desc="Processing templates", unit="template")):
+            template_path = os.path.join(template_folder, filename)
+            
+            # Load template signal
+            template_signal, template_times = self.load_signal(template_path)
+            if template_signal is None:
+                continue  # Skip invalid templates
+
+            # Store original template data for visualization
+            self.original_templates[filename] = {
+                'signal': template_signal,
+                'times': template_times
+            }
+
+            # Preprocess template for SNR calculations
+            template_vec = self.preprocess_signal_for_snr(template_signal, is_template=True)
+            if template_vec is None:
+                continue  # Skip templates that fail during preprocessing
+
+            # Compute both classical and quantum SNR for this signal-template pair
+            metrics = self.compute_snr_comparison(signal_vec, template_vec)
+            results[filename] = metrics
+
+            # Track best classical match
+            if metrics['classical_snr'] > best_classical_snr['snr']:
+                best_classical_snr = {
+                    'template': filename,
+                    'snr': metrics['classical_snr'],
+                    'metrics': metrics
+                }
+
+            # Track best quantum match
+            if metrics['quantum_snr'] > best_quantum_snr['snr']:
+                best_quantum_snr = {
+                    'template': filename,
+                    'snr': metrics['quantum_snr'],
+                    'metrics': metrics
+                }
+
+        # Return comprehensive analysis results
+        return {
+            'results': results,  # All template comparison results
+            'best_classical_snr': best_classical_snr,  # Best classical match
+            'best_quantum_snr': best_quantum_snr,  # Best quantum match
+            'signal_info': {  # Target signal metadata
+                'path': signal_path,
+                'length': len(signal),
+                'processed_length': len(signal_vec)
+            }
+        }
+        
+    def plot_wave_comparison(self, analysis_results: Dict, max_points: int = 10000, time_limit: float = 10.0):
+        """Wrapper method that calls the external plotting function."""
+        return plotting.plot_wave_comparison(self, analysis_results, max_points, time_limit)
+
+    def plot_snr_comparison(self, analysis_results: Dict):
+        """Wrapper method that calls the external plotting function."""
+        return plotting.plot_snr_comparison(analysis_results)
+
+    def plot_comprehensive_analysis(self, analysis_results: Dict, time_limit: float = 10.0):
+        """Wrapper method that calls the external plotting function."""
+        return plotting.plot_comprehensive_analysis(self, analysis_results, time_limit)
+
+    def print_snr_summary(self, analysis_results: Dict):
+        """Wrapper method that calls the external plotting function."""
+        return plotting.print_snr_summary(self, analysis_results)
+
+    def plot_snr_heatmap(self, analysis_results: Dict, save_path: str = None, figsize: Tuple = (12, 8)):
+        """Wrapper method that calls the external SNR heatmap plotting function."""
+        return plotting.plot_snr_heatmap(analysis_results, save_path, figsize)
+
+    def plot_matched_filter_response(self, analysis_results: Dict, template_name: str = None, 
+    save_path: str = None, figsize: Tuple = (15, 10)):
+        """Wrapper method that calls the external matched filter plotting function."""
+        return plotting.plot_matched_filter_response(self, analysis_results, template_name, save_path, figsize)
+
+# Add these lines to your main execution section (after the existing analysis):
+    
+    
+if __name__ == "__main__":
+    # Initialize detector with proper SNR calculations
+    detector = QuantumGWDetector(n_qubits=4, shots=100000)
+    """
+      Initialize the quantum gravitational wave detector with quantum circuit parameters.
+        
+            n_qubits: Number of qubits used in quantum circuits. The more qubits you use, the better answer you will get, 
+            but the longer and more complex the program will be to run
+                          
+            shots: Number of times the quantum circuit will be measured. The more times it runs, the higher the 
+            statistical probability you will get, but the more computing power it will take
+
+            If you increase the number of qubits you use, I would recommend decreasing the number of shots becase of the increase in compute power needed
+            ex: qubits = 4 - shots = 1000000     qubits = 6 - shots = 100000      qubits = 8 - shots = 1000
+"""
+    
+    # Run analysis
+    signal_path = "CW_Data/templates/wave_no_noise.h5"
+    template_folder = "CW_Data/templates"
+    
+
+    results = detector.analyze_all_templates(signal_path, template_folder)
+    
+    if results:
+        # Generate comprehensive analysis
+        detector.plot_comprehensive_analysis(results, time_limit = 10.0)
+                # NEW: Add SNR heatmap visualization
+        detector.plot_snr_heatmap(results, save_path="Circuits/snr_heatmap.png")
+        
+        # NEW: Add matched filter response visualization
+        # This will use the best classical match by default
+        detector.plot_matched_filter_response(results, save_path="Circuits/matched_filter.png")
+
+    else:
+        print("Analysis failed - no results generated")
+
